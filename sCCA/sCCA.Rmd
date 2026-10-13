@@ -1,0 +1,318 @@
+---
+title: "Sparse Canonical Correlation Analysis (sCCA): Brain Structure × CBCL Psychopathology"
+author: "Zheng Li"
+date: "2026-03-09"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+# Clear workspace and set knitr options
+rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+file_path = "/path/to/your/project/"
+
+
+```
+
+```{r load-packages}
+# Core dependencies
+require("PMA")         # Sparse CCA via PMA::CCA()
+require("Matrix")
+require("parallel")    # mclapply
+require("emdbook")
+require("caret")       # createDataPartition, createResample
+require("R.matlab")
+require("MASS")
+require("permute")
+require("matrixStats")  # rowSds
+require("scales")      # percent
+require("cowplot")
+require("ggplot2")
+require("ggrepel")
+require("rasterVis")
+require("plyr")        # rlply
+
+# Local helper functions (ccaDW, reorderCCA, perm.plot, bootplot, ...)
+source(paste(file_path, "cca_functions.R", sep = ""))
+```
+
+```{r load-data}
+set.seed(123)
+
+# Inputs produced by Step1 (see Step1_output/readme.txt)
+CBCL  <- read.csv(paste(file_path, "Input/CBCL_aligned.csv", sep = ""))
+brain <- read.csv(paste(file_path, "Input/brain_aligned.csv", sep = ""))
+```
+
+```{r prepare-covariates}
+# p-factor score used for stratified train/test split
+demo_p_factor <- CBCL$p_factor_mcelroy_harmonized_all_samples
+
+# Demographics used for nuisance regression
+demo <- CBCL[, c("participant_id", "sex", "age")]
+demo$sex <- as.factor(demo$sex)
+
+# Data frames consumed by glm()
+demo.torgr <- within(demo, rm("participant_id"))
+CBCL.new   <- within(CBCL, rm("participant_id", "p_factor_mcelroy_harmonized_all_samples"))
+```
+
+```{r residualize-cbcl}
+# Regress age and sex out of every CBCL item; keep residuals for sCCA
+CBCL_reg <- apply(CBCL.new, 2, function(x) {
+  residuals.glm(glm(x ~ age + sex, data = demo.torgr), type = "response")
+})
+save(CBCL_reg, file = "CBCL_reg.RData")
+```
+
+```{r prepare-matrices}
+# Drop the participant-ID column from brain features; keep a plain numeric matrix
+brain_noID  <- brain[, 2:ncol(brain)]
+brain_array <- as.matrix(unname(brain_noID))   # rows = subjects, cols = edges
+# brain_array <- scale(brain_array, center = TRUE, scale = TRUE)
+
+CBCL_array <- unname(CBCL_reg)                # rows = subjects, cols = CBCL items
+# CBCL_array  <- scale(CBCL_array, center = TRUE, scale = TRUE)
+# CBCL_array <- scale(CBCL_array, center = FALSE, scale = TRUE)
+
+# Bundle into a list for downstream calls
+data <- list(brain = brain_array, behavior = CBCL_array)
+
+print(paste("Training sample has", dim(brain_array)[1], "subjects."))
+print(paste("rsFC data has", dim(brain_array)[2], "edges."))
+print(paste("clinical data has", dim(CBCL_array)[2], "items."))
+```
+
+```{r train-test-split}
+# 10 repeated 2/3 splits, stratified on p-factor to preserve severity distribution
+sampleid <- createDataPartition(
+  demo_p_factor,
+  p     = 0.667,
+  list  = TRUE,
+  times = 10
+)
+
+# Corresponding brain / behavior subsets for each split (parallelized)
+brain_sample    <- mclapply(sampleid, function(id) data$brain[id, ])
+behavior_sample <- mclapply(sampleid, function(id) data$behavior[id, ])
+```
+
+```{r grid-search}
+# Grid over (penalty_x, penalty_y); pick the pair with the highest mean canonical correlation
+x_pen <- seq(0.1, 1, length.out = 10)
+y_pen <- seq(0.1, 1, length.out = 10)
+
+scca.gs <- ccaDWfoldgs(brain_sample, behavior_sample, x_pen, y_pen)
+gs.mat  <- matrix(scca.gs$GS[, "COR_MEAN"], nrow = 10, ncol = 10)
+rownames(gs.mat) <- x_pen
+colnames(gs.mat)  <- y_pen
+print(scca.gs)
+```
+
+```{r select-components}
+# Fit sCCA on the full sample to estimate variance explained per component
+modenum <- dim(data$behavior)[2]  # upper bound on number of canonical variates
+
+# Penalties selected from the grid search above
+scca.org <- ccaDW(data$brain, data$behavior, 0.2, 0.3, modenum)
+
+# Re-standardize features for the covariance decomposition
+brain_std <- apply(data$brain,    2, scale)
+med_std   <- apply(data$behavior, 2, scale)
+# brain_std <- data$brain
+# med_std   <- data$behavior
+
+# Covariance structure across components and variance explained per component
+covmat <- t(scca.org$u) %*% t(brain_std) %*% med_std %*% scca.org$v
+varE   <- diag(covmat)^2 / sum(diag(covmat)^2)
+
+varE.df <- data.frame(modenum = as.factor(1:modenum), var = varE)
+save(varE.df, file = "varE.RData")
+save(varE,    file = "varE_org.RData")
+```
+
+```{r scree-plot}
+# Number of components to retain (chosen from the scree plot)
+candnum <- 4
+
+# Re-build the data.frame with numeric (not factor) modenum for a continuous axis
+varE.df <- data.frame(
+  modenum = 1:modenum,
+  var     = varE
+)
+
+p.var <- ggplot(varE.df, aes(modenum, var)) +
+  geom_point(stat = "identity", aes(color = var > varE[candnum + 1], size = var)) +
+  geom_hline(yintercept = 1 / modenum, linetype = "dashed") +
+  scale_x_continuous(
+    name   = "Mode",
+    limits = c(0, modenum),
+    breaks = c(1, seq(10, modenum, 10))
+  ) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    limits = c(0, 0.2),
+    labels = percent,
+    name   = "Variance Explained",
+    breaks = seq(0, 0.2, length = 4)
+  ) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none")
+
+ggsave(
+  filename = "scree_plot.png",
+  plot     = p.var,
+  width    = 10,
+  height   = 6,
+  dpi      = 300,
+  device   = "png"
+)
+
+p.var
+```
+
+```{r run-scca-splits}
+# Fit the retained-component model on the full sample, and refit on every 2/3 split
+scca.cand <- ccaDW(data$brain, data$behavior, 0.2, 0.3, candnum)
+scca.cca  <- mclapply(seq_along(sampleid), function(i) {
+  ccaDW(brain_sample[[i]], behavior_sample[[i]], 0.2, 0.3, 20)
+})
+
+save(scca.cca,  file = "scca_cca.RData")
+save(scca.cand, file = "scca_cand.RData")
+```
+
+```{r reorder-components}
+# Align component order across splits (sign + permutation) so they are comparable
+scca.cca.ro <- sapply(scca.cca, function(x) reorderCCA(x, scca.cand, 20))
+save(scca.cca.ro, file = "scca_cca_ro.RData")
+```
+
+```{r average-correlation}
+# Mean canonical correlation across splits
+scca.cca.cor <- rowMeans(simplify2array(scca.cca.ro["cors", ]), na.rm = TRUE)
+save(scca.cca.cor, file = "scca_cca_cor.RData")
+```
+
+```{r correlation-se}
+# Standard error of the mean canonical correlation across splits
+scca.cca.cor.se <- rowSds(simplify2array(scca.cca.ro["cors", ]), na.rm = TRUE) /
+  sqrt(dim(scca.cca.ro)[2])
+```
+
+```{r correlation-plot}
+cor.df       <- data.frame(modenum = as.factor(1:candnum),
+                           cor     = scca.cca.cor,
+                           se      = scca.cca.cor.se)
+cor.df.order <- cor.df
+cor.lim      <- aes(ymax = cor.df.order$cor + cor.df.order$se,
+                    ymin = cor.df.order$cor - cor.df.order$se)
+
+p.cor <- ggplot(cor.df.order, aes(1:length(modenum), cor, label = round(cor, 2))) +
+  geom_bar(width = 0.75, stat = "identity", fill = "#00BFA5") +
+  geom_errorbar(cor.lim, width = 0.25) +
+  geom_text(size = 4, position = position_dodge(width = 0.9),
+            vjust = -1, color = "grey") +
+  scale_x_discrete(name = "Mode", limits = c(1:candnum)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 0.8),
+                     name   = "CCA Correlation",
+                     breaks = seq(0, 0.8, length = 5)) +
+  theme_classic(base_size = 20) +
+  coord_cartesian(ylim = c(0.1, 0.9)) +
+  theme(legend.position = "none")
+
+ggsave(
+  filename = "cor_plot.png",
+  plot     = p.cor,
+  width    = 10,
+  height   = 6,
+  dpi      = 300,
+  device   = "png"
+)
+
+p.cor
+```
+
+```{r permutation-test}
+# Empirical p-values: permute the behavior (CBCL) matrix row-wise and refit sCCA
+num.perm      <- 1000
+behavior.perm <- rlply(num.perm, data$behavior[sample(nrow(data$behavior)), ])
+scca.perm.cca <- sapply(behavior.perm, function(y_perm) {
+  ccaDWpermorder(data$brain, y_perm, 0.2, 0.3, candnum, scca.cand)
+})
+save(scca.perm.cca, file = "scca_perm_cca.RData")
+```
+
+```{r permutation-pvalue}
+perm.cor  <- simplify2array(scca.perm.cca["cors", ])
+perm.pval <- sapply(seq_along(cor.df$cor), function(x) {
+  (length(which(perm.cor[x, ] >= cor.df$cor[x]))) /
+    length(which(is.na(perm.cor[x, ]) == FALSE))
+})
+save(perm.cor,  file = "perm_cor.RData")
+save(perm.pval, file = "perm_pval.RData")
+print(perm.pval)
+```
+
+```{r fdr-adjust}
+# Benjamini-Hochberg FDR across components
+perm.pval.fdr <- p.adjust(perm.pval, method = "fdr")
+print(perm.pval.fdr)
+```
+
+```{r permutation-plot}
+perm.cor.df <- as.data.frame(t(perm.cor))
+perm.pass  <- which(perm.pval.fdr < 0.05)
+permplots  <- lapply(perm.pass, function(x) {
+  perm.plot(perm.cor.df, cor.df, perm.pval.fdr, x)
+})
+permplots[[1]]
+```
+
+```{r bootstrap}
+set.seed(123)
+subjid  <- demo_merge   # NOTE: inherited from upstream environment
+bootnum <- 1000
+
+# Bootstrap resamples stratified by p-factor
+bootid <- createResample(demo_p_factor, list = TRUE, times = bootnum)
+
+# Bootstrap brain / behavior matrices
+brain_boot    <- lapply(bootid, function(id) data$brain[id, ])
+behavior_boot <- lapply(bootid, function(id) data$behavior[id, ])
+
+# Refit sCCA on each bootstrap sample
+scca.boot <- mclapply(seq_along(bootid), function(i) {
+  ccaDW(brain_boot[[i]], behavior_boot[[i]], 0.9, 0.5, 10)
+}, mc.cores = 1)
+
+# Align components to the candidate solution
+scca.boot.ro <- lapply(1:bootnum, function(i) {
+  reorderCCA(scca.boot[[i]], scca.cand, 10)
+})
+
+# Extract loadings for components that survived FDR
+scca.boot.u <- lapply(perm.pass, function(x) {
+  sapply(1:bootnum, function(i) scca.boot.ro[[i]]$u[, x])
+})
+scca.boot.v <- lapply(perm.pass, function(x) {
+  sapply(1:bootnum, function(i) scca.boot.ro[[i]]$v[, x])
+})
+
+# Bootstrap CIs (99.5% for u loadings, 95% for v loadings)
+u.boot.plot <- lapply(seq_along(perm.pass), function(x) {
+  bootplot_u(scca.cand$u[, perm.pass[x]], scca.boot.u[[x]])
+})
+v.boot.plot <- lapply(seq_along(perm.pass), function(x) {
+  bootplot(scca.cand$v[, perm.pass[x]], scca.boot.v[[x]])
+})
+```
+
+```{r save-bootstrap}
+save(u.boot.plot, file = "u_boot_plot2000.RData")
+save(v.boot.plot, file = "v_boot_plot2000.RData")
+```

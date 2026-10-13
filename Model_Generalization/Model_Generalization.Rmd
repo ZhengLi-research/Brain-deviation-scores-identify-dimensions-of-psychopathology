@@ -1,0 +1,210 @@
+---
+title: "sCCA Model Generalization Validation on Independent Dataset"
+output: html_document
+date: "2026-08-05"
+---
+
+```{r setup, include=FALSE}
+# Global chunk options: show code by default
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<!-- ============================================================ -->
+<!-- Section 1: Load the independent validation data              -->
+<!-- ============================================================ -->
+
+```{r data-loading}
+# ================== Path configuration ==================
+# All paths below are resolved relative to this Rmd file's directory,
+# so the whole project can be moved or cloned anywhere without editing.
+# The project root should contain the two sub-directories below.
+rmd_path <- knitr::current_input(dir = TRUE)
+if (length(rmd_path) == 0L) {
+  # Not knitting (e.g. running chunks directly in RStudio): current_input() has
+  # no value, so fall back to the working directory, which RStudio sets to the
+  # directory of this Rmd file.
+  proj_dir <- getwd()
+} else if (grepl("[.]Rmd$", rmd_path, ignore.case = TRUE)) {
+  # current_input() returned the full file path -> take its parent directory
+  proj_dir <- dirname(rmd_path)
+} else {
+  # current_input() already returned the directory
+  proj_dir <- rmd_path
+}
+data_dir  <- file.path(proj_dir, 'Independent_Data_Input')
+param_dir <- file.path(proj_dir, 'Model_Parameters')
+
+# Load required packages
+library(readr)
+
+# Read independent validation data (brain structure features + CBCL behavior)
+brain <- read_csv(file.path(data_dir, 'brain_aligned.csv'))
+cbcl  <- read.csv(file.path(data_dir, 'CBCL_aligned.csv'))
+
+# Covariates (columns 2-3, used for regression prediction later)
+cov <- brain[, 2:3]
+
+# Brain feature matrix: drop leading columns (ID, covariates, etc.), keep numeric
+brain_sub <- as.matrix(unname(brain[, 4:153]))
+
+# CBCL behavior matrix: convert to integer
+cbcl_sub <- apply(cbcl[, 4:120], 2, as.integer)
+```
+
+<!-- ============================================================ -->
+<!-- Section 2: Load training-phase model parameters and scale    -->
+<!-- ============================================================ -->
+
+```{r load-model-parameters}
+# Load standardization parameters saved from the training phase
+# (centering means and scaling SDs)
+load(file.path(param_dir, 'my_center.RData'))
+load(file.path(param_dir, 'my_scale.RData'))
+load(file.path(param_dir, 'cbcl_center.RData'))
+load(file.path(param_dir, 'cbcl_scale.RData'))
+
+# Load the trained CBCL regression models (to remove covariate effects)
+load(file.path(param_dir, 'CBCL_trained_models.RData'))
+
+# Load bootstrap stable features and sCCA candidate features
+load(file.path(param_dir, 'u_boot_plot2000.RData'))
+load(file.path(param_dir, 'v_boot_plot2000.RData'))
+load(file.path(param_dir, 'scca_cand.RData'))
+
+# Assign the loaded standardization parameters to the current environment
+# (cbcl_center and cbcl_scale are already created directly by load())
+brain_center <- my_center
+brain_scale  <- my_scale
+
+# Standardize brain features using the training means and SDs
+# brain_sub <- scale(brain_sub)  # use this line instead for default scaling
+brain_sub <- scale(brain_sub, center = brain_center, scale = brain_scale)
+```
+
+<!-- ============================================================ -->
+<!-- Section 3: Remove covariate effects from CBCL (residuals)    -->
+<!-- ============================================================ -->
+
+```{r compute-cbcl-residuals}
+# Regress each CBCL column on the covariates using the trained models,
+# then take the residuals
+cbcl_sub_residual <- sapply(1:ncol(cbcl_sub), function(i) {
+
+  # Take the i-th model (matched by column order, not by name)
+  fit <- CBCL_models[[i]]
+
+  # Take the i-th column of the new data
+  x <- cbcl_sub[, i]
+
+  # Predict from the covariates
+  pred <- predict(fit, newdata = cov)
+
+  # Return the residual (observed - predicted)
+  x - pred
+})
+
+# Convert residuals back to a matrix (preserving rows and columns)
+cbcl_sub_residual <- unname(cbcl_sub_residual)
+
+# Standardize residuals using the training means and SDs
+# cbcl_sub_residual <- scale(cbcl_sub_residual)  # use this instead for default scaling
+cbcl_sub_residual <- scale(cbcl_sub_residual, center = cbcl_center, scale = cbcl_scale)
+```
+
+<!-- ============================================================ -->
+<!-- Section 4: Extract brain loadings (sCCA weights + filtering) -->
+<!-- ============================================================ -->
+
+```{r extract-brain-loadings}
+# Brain loading matrix (from the sCCA candidate result)
+brain_loading <- scca.cand$u
+
+# Flip the sign of dimensions 1 and 4 (to match the training phase)
+brain_loading[, c(1, 4)] <- brain_loading[, c(1, 4)] * -1
+
+# Keep only the bootstrap-stable features; set all others to 0
+rows_to_modify_vect1 <- setdiff(1:nrow(brain_loading), u.boot.plot[[1]]$fea)
+brain_loading[rows_to_modify_vect1, 1] <- 0
+
+rows_to_modify_vect1 <- setdiff(1:nrow(brain_loading), u.boot.plot[[2]]$fea)
+brain_loading[rows_to_modify_vect1, 2] <- 0
+
+rows_to_modify_vect1 <- setdiff(1:nrow(brain_loading), u.boot.plot[[3]]$fea)
+brain_loading[rows_to_modify_vect1, 3] <- 0
+
+rows_to_modify_vect1 <- setdiff(1:nrow(brain_loading), u.boot.plot[[4]]$fea)
+brain_loading[rows_to_modify_vect1, 4] <- 0
+```
+
+<!-- ============================================================ -->
+<!-- Section 5: Extract behavior loadings (sCCA weights + filt.)  -->
+<!-- ============================================================ -->
+
+```{r extract-cbcl-loadings}
+# Behavior loading matrix (from the sCCA candidate result)
+cbcl_loading <- scca.cand$v
+
+# Flip the sign of dimensions 1 and 4 (to match the training phase)
+cbcl_loading[, c(1, 4)] <- cbcl_loading[, c(1, 4)] * -1
+
+# Keep only the bootstrap-stable features; set all others to 0
+rows_to_modify_vect1 <- setdiff(1:nrow(cbcl_loading), v.boot.plot[[1]]$fea)
+cbcl_loading[rows_to_modify_vect1, 1] <- 0
+
+rows_to_modify_vect1 <- setdiff(1:nrow(cbcl_loading), v.boot.plot[[2]]$fea)
+cbcl_loading[rows_to_modify_vect1, 2] <- 0
+
+rows_to_modify_vect1 <- setdiff(1:nrow(cbcl_loading), v.boot.plot[[3]]$fea)
+cbcl_loading[rows_to_modify_vect1, 3] <- 0
+
+rows_to_modify_vect1 <- setdiff(1:nrow(cbcl_loading), v.boot.plot[[4]]$fea)
+cbcl_loading[rows_to_modify_vect1, 4] <- 0
+```
+
+<!-- ============================================================ -->
+<!-- Section 6: Compute brain and behavior canonical scores       -->
+<!-- ============================================================ -->
+
+```{r compute-scores}
+# Brain canonical scores = standardized brain features %*% brain loadings
+brain_loading <- as.matrix(brain_loading)
+brain_score <- brain_sub %*% brain_loading
+# brain_score <- brain_score[, -4]  # uncomment to drop dimension 4
+
+# Behavior canonical scores = standardized residuals %*% behavior loadings
+cbcl_loading <- as.matrix(cbcl_loading)
+cbcl_score <- cbcl_sub_residual %*% cbcl_loading
+# cbcl_score <- cbcl_score[, -4]  # uncomment to drop dimension 4
+```
+
+<!-- ============================================================ -->
+<!-- Section 7: Cross-dataset validation - correlation & FDR      -->
+<!-- ============================================================ -->
+
+```{r test-correlations}
+# Correlate brain vs behavior canonical scores separately for each dimension
+c1 <- cor.test(cbcl_score[, 1], brain_score[, 1])
+c2 <- cor.test(cbcl_score[, 2], brain_score[, 2])
+c3 <- cor.test(cbcl_score[, 3], brain_score[, 3])
+c4 <- cor.test(cbcl_score[, 4], brain_score[, 4])
+
+# Extract correlation coefficients, p-values, and CI bounds
+r_vals  <- c(c1$estimate, c2$estimate, c3$estimate, c4$estimate)
+p_raw   <- c(c1$p.value, c2$p.value, c3$p.value, c4$p.value)
+ci_low  <- c(c1$conf.int[1], c2$conf.int[1], c3$conf.int[1], c4$conf.int[1])
+ci_high <- c(c1$conf.int[2], c2$conf.int[2], c3$conf.int[2], c4$conf.int[2])
+
+# BH (Benjamini-Hochberg) FDR correction
+p_fdr <- p.adjust(p_raw, method = "BH")
+
+# Summarize results into a table
+res_df <- data.frame(
+  dimension = 1:4,
+  r         = round(r_vals, 3),
+  ci_lower  = round(ci_low, 3),
+  ci_upper  = round(ci_high, 3),
+  p_raw     = round(p_raw, 4),
+  p_fdr     = round(p_fdr, 4)
+)
+print(res_df)
+```

@@ -1,0 +1,21 @@
+# Rendered outputs
+*.html
+*_files/
+*_cache/
+*.pdf
+
+# R / RStudio session files
+.RData
+.RDataTmp
+.Rhistory
+.Rapp.history
+.Ruserdata
+.Rproj.user/
+.Rproj.user
+*.Rproj
+
+# macOS
+.DS_Store
+
+# Note: Independent_Data_Input/ and Model_Parameters/ are intentionally NOT
+# ignored here. Decide whether to publish them based on data-usage licensing.
